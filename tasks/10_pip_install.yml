@@ -1,0 +1,5 @@
+---
+- name: install jq pip module
+  pip:
+    name: jq
+    extra_args: "--user"

@@ -1,0 +1,4 @@
+---
+- include_tasks: 10_pip_install.yml
+- include_tasks: 15_disconnected_registry_create.yml
+- include_tasks: 20_pull_build_push.yml

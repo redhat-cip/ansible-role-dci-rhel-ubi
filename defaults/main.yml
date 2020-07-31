@@ -1,0 +1,13 @@
+---
+cert_country: US #it must be two letters country
+cert_state: MA
+cert_locality: Westford
+cert_organization: Red Hat
+cert_organizational_unit: DCI
+registry_port: 5000
+registry_dir: "/opt/registry"
+firewall: firewalld
+registry_auth_file: registry-auths.json
+upstream_auth_file: brew-auths.json
+disconnected_registry_user: dummy
+disconnected_registry_password: dummy

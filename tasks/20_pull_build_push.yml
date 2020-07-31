@@ -1,0 +1,71 @@
+---
+- include_vars:
+    file: "{{ local_repo }}/{{ topic }}/compose/metadata/osbs.json"
+    name: osbs
+
+- name: Find UBI repository
+  set_fact:
+    original_location: '{{ osbs | jq( ''.BaseOS.x86_64[].docker | select(.config.config.Labels.name == "ubi8-minimal") | .repositories[0]'') }}'
+
+- name: Update brew location
+  set_fact:
+    updated_location: "{{ original_location |
+               replace ('registry-proxy.engineering.redhat.com/', '') }}"
+
+- name: Split Name and Tag
+  set_fact:
+    ubi_server: "brew.registry.redhat.io"
+    ubi_name: "{{ updated_location.split(':')[0] }}"
+    ubi_tag: "{{ updated_location.split(':')[1] }}"
+
+- name: Generate temp dir
+  tempfile:
+    state: directory
+  register: ubi_reg
+
+- name: load local auth from file
+  include_vars:
+    file: "{{ ansible_env.HOME }}/{{ registry_auth_file }}"
+    name: imported_local_auth
+  no_log: true
+
+- name: load upstream auth from file
+  include_vars:
+    file: "{{ local_repo }}/{{ topic }}/ubi/{{ upstream_auth_file }}"
+    name: imported_upstream_auth
+  no_log: true
+
+- name: append more key/values
+  set_fact:
+    combined_auth: "{{ imported_local_auth | combine(imported_upstream_auth, recursive=True) }}"
+  no_log: true
+
+- name: write var to file
+  copy:
+    content: "{{ combined_auth | to_nice_json }}"
+    dest: "{{ ubi_reg.path }}/{{ registry_auth_file }}"
+  no_log: true
+
+- name: Generate container files
+  template:
+    src: "{{ item }}"
+    dest: "{{ ubi_reg.path }}/{{ item }}"
+  loop:
+    - ubi.repo
+    - Dockerfile
+
+- name: Build and Push UBI image
+  podman_image:
+    name: "{{ topic |lower }}-ubi-minimal"
+    tag: "{{ ubi_tag }}"
+    path: "{{ ubi_reg.path }}"
+    push: yes
+    auth_file: "{{ ubi_reg.path }}/{{ registry_auth_file }}"
+    push_args:
+      dest: "{{ local_registry }}/{{ topic |lower }}-ubi-minimal"
+
+- name: Clean up Temp dir
+  delegate_to: localhost
+  file:
+    path: "{{ ubi_reg.path }}"
+    state: absent

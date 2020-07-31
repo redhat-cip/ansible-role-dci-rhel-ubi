@@ -1,0 +1,239 @@
+---
+- name: Verify the certificate variables are set
+  fail:
+    msg:
+      - "Must specify cert_country, cert_state, cert_locality,"
+      - " cert_organization, and cert_organizational_unit"
+      - "cert_country:             {{ cert_country }}"
+      - "cert_state:               {{ cert_state }}"
+      - "cert_locality:            {{ cert_locality }}"
+      - "cert_organization:        {{ cert_organization }}"
+      - "cert_organizational_unit: {{ cert_organizational_unit }}"
+  when: ( cert_country is not defined )
+    or  ( cert_country | bool )
+    or  ( cert_state is not defined )
+    or  ( cert_state | bool )
+    or  ( cert_locality is not defined )
+    or  ( cert_locality | bool )
+    or  ( cert_organization is not defined )
+    or  ( cert_organization | bool )
+    or  ( cert_organizational_unit is not defined )
+    or  ( cert_organizational_unit | bool )
+
+- name: Make sure needed packages are installed
+  package:
+    state: present
+    name: "{{ item }}"
+  loop:
+    - "{{ packages_registry | default([]) }}"
+  become: true
+
+- name: Open registry port, zone public, for firewalld
+  firewalld:
+    port: "{{ registry_port }}/tcp"
+    permanent: true
+    immediate: true
+    state: enabled
+    zone: "{{ item }}"
+  become: true
+  with_items:
+    - public
+  when: firewall != "iptables"
+
+- name: Open registry port for iptables
+  iptables:
+    chain: INPUT
+    protocol: tcp
+    destination_port: "{{ registry_port }}"
+    jump: ACCEPT
+  become: true
+  when: firewall == "iptables"
+
+- name: Save iptables configuration
+  shell: |
+    /usr/sbin/iptables-save > /etc/sysconfig/iptables
+  become: true
+  when: firewall == "iptables"
+
+- name: Create directory to hold the registry files
+  file:
+    path: "{{ item }}"
+    state: directory
+    owner: "{{ ansible_env.USER }}"
+    group: "{{ ansible_env.USER }}"
+    mode: u=rwX,g=rX,o=rX
+    recurse: true
+  loop:
+    - "{{ registry_dir_auth }}"
+    - "{{ registry_dir_cert }}"
+    - "{{ registry_dir_data }}"
+  become: true
+
+- name: Generate htpasswd entry
+  command:
+    htpasswd -bBn {{ disconnected_registry_user }}
+    {{ disconnected_registry_password }}
+  register: htpass_entry
+
+- name: Write htpasswd file
+  copy:
+    content: '{{ htpass_entry.stdout }}'
+    dest: "{{ registry_dir_auth }}/htpasswd"
+    owner: "{{ ansible_env.USER }}"
+    group: "{{ ansible_env.USER }}"
+    backup: true
+    force: true
+
+- name: Set disconnected_auth
+  set_fact:
+    disconnected_registry_up:
+      "{{ disconnected_registry_user }}:{{ disconnected_registry_password }}"
+
+- name: Create registry auth for pullsecret
+  set_fact:
+    disconnected_auth:
+      '{"auths":  {"{{ local_registry }}": {"auth": "{{ disconnected_registry_up | b64encode }}",
+      "email": "{{ ansible_env.USER }}@redhat.com" } } }'
+
+- name: Write auth for disconnected to registry host
+  copy:
+    content: "{{ disconnected_auth }}"
+    dest: "{{ ansible_env.HOME }}/{{ registry_auth_file }}"
+    backup: true
+    force: true
+
+- name: Generate an OpenSSL private key
+  openssl_privatekey:
+    path: "{{ registry_dir_cert }}/domain.key"
+
+- name: Generate an OpenSSL CSR
+  openssl_csr:
+    path: "{{ registry_dir_cert }}/domain.csr"
+    privatekey_path: "{{ registry_dir_cert }}/domain.key"
+    common_name: "{{ groups['jumphost'][0] }}"
+    country_name: "{{ cert_country }}"
+    state_or_province_name: "{{ cert_state }}"
+    locality_name: "{{ cert_locality }}"
+    organization_name: "{{ cert_organization }}"
+    organizational_unit_name: "{{ cert_organizational_unit }}"
+    basic_constraints_critical: true
+    create_subject_key_identifier: true
+    basic_constraints: ['CA:TRUE']
+
+- name: Generate a selfsigned OpenSSL CA Certificate
+  openssl_certificate:
+    path: "{{ registry_dir_cert }}/domainCA.crt"
+    privatekey_path: "{{ registry_dir_cert }}/domain.key"
+    csr_path: "{{ registry_dir_cert }}/domain.csr"
+    provider: selfsigned
+
+- name: Generate an ownca OpenSSL Certificate
+  openssl_certificate:
+    path: "{{ registry_dir_cert }}/domain.crt"
+    ownca_privatekey_path: "{{ registry_dir_cert }}/domain.key"
+    csr_path: "{{ registry_dir_cert }}/domain.csr"
+    ownca_path: "{{ registry_dir_cert }}/domainCA.crt"
+    ownca_create_authority_key_identifier: true
+    provider: ownca
+
+- name: Copy cert to pki directory
+  copy:
+    src: "{{ registry_dir_cert }}/domain.crt"
+    dest: /etc/pki/ca-trust/source/anchors/domain.crt
+    remote_src: true
+    group: "{{ ansible_env.USER }}"
+    owner: "{{ ansible_env.USER }}"
+    mode: 0644
+    force: true
+    backup: true
+  become: true
+
+- name: Update the CA trust files
+  command: update-ca-trust extract
+  become: true
+
+- name: Create container to serve the registry
+  podman_container:
+    name: "{{ pod_name_registry }}"
+    image: docker.io/library/registry:2
+    state: stopped
+    network: host
+    volumes:
+      - "{{ registry_dir_data }}:/var/lib/registry:z"
+      - "{{ registry_dir_auth }}:/auth:z"
+      - "{{ registry_dir_cert }}:/certs:z"
+    env:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_HTTP_SECRET: ALongRandomSecretForRegistry
+      REGISTRY_AUTH_HTPASSWD_PATH: auth/htpasswd
+      REGISTRY_HTTP_TLS_CERTIFICATE: certs/domain.crt
+      REGISTRY_HTTP_TLS_KEY: certs/domain.key
+  register: registry_container_info
+
+- name: Setting facts about container
+  set_fact:
+    container_registry_name:
+      "{{ registry_container_info.ansible_facts.podman_container.Name }}"
+    container_registry_pidfile:
+      "{{ registry_container_info.ansible_facts.podman_container.ConmonPidFile }}"
+
+- name: Ensure user specific systemd instance are persistent
+  command: |
+          /usr/bin/loginctl enable-linger {{ ansible_env.USER }}
+
+- name: Create systemd user directory
+  file:
+    path: "{{ ansible_user_dir }}/.config/systemd/user"
+    state: directory
+    owner: "{{ ansible_env.USER }}"
+    group: "{{ ansible_env.USER }}"
+    mode: '0775'
+
+- name: Copy the systemd service file
+  copy:
+    content: |
+      [Unit]
+      Description=Podman container-registry.service
+      [Service]
+      Restart=on-failure
+      ExecStart=/usr/bin/podman start {{ container_registry_name }}
+      ExecStop=/usr/bin/podman stop -t 10 {{ container_registry_name }}
+      KillMode=none
+      Type=forking
+      PIDFile={{ container_registry_pidfile }}
+      [Install]
+      WantedBy=default.target
+    dest: "{{ ansible_user_dir }}/.config/systemd/user/container-registry.service"
+    owner: "{{ ansible_env.USER }}"
+    group: "{{ ansible_env.USER }}"
+    mode: '0644'
+
+- name: Reload systemd service
+  systemd:
+    daemon_reexec: true
+    scope: user
+  environment:
+    DBUS_SESSION_BUS_ADDRESS:
+      "{{ ansible_env.DBUS_SESSION_BUS_ADDRESS|default('unix:path=/run/user/'
+      +  ansible_effective_user_id|string + '/bus') }}"
+
+- name: Enable container-registry.service
+  systemd:
+    name: container-registry
+    enabled: true
+    scope: user
+  environment:
+    DBUS_SESSION_BUS_ADDRESS:
+      "{{ ansible_env.DBUS_SESSION_BUS_ADDRESS|default('unix:path=/run/user/'
+      +  ansible_effective_user_id|string + '/bus') }}"
+
+- name: Start container-registry.service
+  systemd:
+    name: container-registry
+    state: started
+    scope: user
+  environment:
+    DBUS_SESSION_BUS_ADDRESS:
+      "{{ ansible_env.DBUS_SESSION_BUS_ADDRESS|default('unix:path=/run/user/'
+      +  ansible_effective_user_id|string + '/bus') }}"
