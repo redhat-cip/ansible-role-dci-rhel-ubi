@@ -2,8 +2,8 @@
 %define _binary_payload w0.gzdio
 
 Name:       ansible-role-dci-rhel-ubi
-Version:    0.0.1
-Release:    1%{?dist}
+Version:    0.1.0
+Release:    1.VERS%{?dist}
 Summary:    ansible-role-dci-rhel-ubi
 License:    ASL 2.0
 URL:        https://github.com/redhat-cip/ansible-role-dci-rhel-ubi
@@ -38,5 +38,7 @@ cp -r filter_plugins %{buildroot}%{_datadir}/dci/roles/dci-rhel-ubi
 
 
 %changelog
+* Mon Oct 30 2023 Guillaume Vincent <gvincent@redhat.com> - 0.1.0-1
+- Fix rpm name
 * Wed Jul 29 2020 Bill Peck <bpeck@redhat.com> - 0.0.1-1
 - Initial release
